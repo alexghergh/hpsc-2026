@@ -2,109 +2,83 @@
 
 ![Speed-up matplotlib plot](./trajectory.png)
 
-First end-to-end run of the cuda_source problem source. Problem: dense FP32 GEMM
-`C = A·B`, column-major, `m=10240, k=4096, n=8192`, reference `cublasGemmEx`
-with `CUBLAS_COMPUTE_32F_FAST_16F` + `CUBLAS_GEMM_DEFAULT_TENSOR_OP`. Tolerance:
-mean-abs-error < 1.0e-2. The agent ran the harness on one H100 (Hinadori)
-system; the final kernel was then re-evaluated independently on a second H100
-(Tsubame) - the test host - and that is the result that counts. The agent's only
-handle on the problem was the harness MCP server (`workspace_overview`,
-`read_workspace_file`, `write_candidate`, `run_candidate`, `profile_ncu`,
-`goal_status`, `best_result`, `complete_problem`). Profiler was wired but
-produced cuBLAS's stats on every call due to a harness bug (fixed in a later
-commit), so the agent drove the entire 56-turn search off end-to-end
-`run_candidate` timings — measured on the harness host, not the test host.
+FP32 GEMM `C = A·B`, column-major, `m=10240 k=4096 n=8192`. Reference is cuBLAS
+GemmEx (`CUBLAS_COMPUTE_32F_FAST_16F`, `CUBLAS_GEMM_DEFAULT_TENSOR_OP`).
+Correctness tolerance: mean-abs-error < 1e-2. Self-set bar to beat: **~600
+TFLOPS / 1.145 ms** (≈60% of H100's 989 TFLOPS dense FP16/FP32-accum peak).
 
-**Result on the test host: did NOT beat cuBLAS.** Final candidate 2.085 ms /
-329,718 GFLOPS vs cuBLAS 1.926 ms / 356,963 GFLOPS — cuBLAS +8.2%, candidate at
-~33% of H100's 989 TFLOPS dense FP16/FP32-accum peak. On the harness host the
-same kernel beats cuBLAS by 7.3% (2.443 ms / 281,330 GFLOPS vs 2.623 ms /
-262,089 GFLOPS), so the agent's internal feedback loop reported a win. The
-margin flips because the test host's cuBLAS dispatches a `wgmma.mma_async`-based
-Hopper kernel (sm_90a, warp-group MMA), while the harness host's cuBLAS
-dispatches an Ampere-style `mma.sync.m16n8k16` algorithm — the same instruction
-the candidate uses. On the harness host both code paths share an instruction
-ceiling and the candidate's tiling/swizzle wins; on the test host the candidate
-is locked into the slower ISA. The decisive optimization moves were splitting
-the fp32→fp16 conversion into a dedicated kernel so the matmul hot loop only
-reads fp16, pairing that with explicit `ldmatrix.x4.trans` +
-`mma.sync.aligned.m16n8k16` PTX (which beats the `nvcuda::wmma` C++ API),
-`BM=128 BN=256 BK=64` tiling, padded conflict-free shared (`APAD=BPAD=8`), and a
-`GROUP=8` threadblock swizzle for L2 B-panel reuse. The agent stayed entirely
-within Ampere-era intrinsics — it never considered TMA, `wgmma`, thread-block
-clusters, DSMEM, `mbarrier`, or stream-K. That headroom is now the entire story:
-the next agent run has to reach `wgmma`-class instruction throughput to clear
-the test-host cuBLAS, not just out-tile an mma.sync algorithm.
+## Result
+
+The final kernel is shipped as [`13_tensorcore.cu`](13_tensorcore.cu),
+measured on a single H100:
+
+| | candidate | cuBLAS | margin |
+|---|---:|---:|---:|
+| runtime | 1.197 ms | 1.933 ms | **candidate 1.62× cuBLAS** |
+| GFLOPS | 574,079 | 355,508 | — |
+| % of H100 peak (989 TFLOPS) | **58%** | 36% | — |
+
+The kernel reaches `wgmma.mma_async`, the Hopper warp-group MMA path. At
+58% of H100 peak it is within ~4.5% of the self-set 600 TFLOPS / 1.145 ms
+target.
 
 ## Run
 
 | | |
 |---|---|
-| Model | `claude-opus-4-8` (Claude Code) |
-| Reasoning effort | `max` (Claude `effortLevel: "max"`) |
-| Wall-clock | 82.9 min |
-| Cost | $18.10 |
-| Turns completed | 56 |
-| Input / output tokens | 12.94M / 358k |
-| Subagent spawns | 27 |
-| `run_candidate` calls | 22 (all correct, zero cheating flags) |
-| `profile_ncu` calls | 3 (all returned cuBLAS's stats — harness bug, fixed) |
-| `web_search` calls | 0 |
-| Harness-host terminal state | `done` / `measured_outcome: beats_baseline` |
-| Test-host outcome | cuBLAS +8.2%, candidate did not beat baseline |
+| Model | `claude-opus-4-8` (max reasoning) |
+| Wall-clock | 180 min |
+| Cost | ~$86 (Opus API price) |
+| Attempts | 36 total: 25 correct, 11 failed to build or run |
+| Profile runs | 8 |
 
-## Trajectory (harness host)
+## Trajectory
 
-All timings below are from the agent's `run_candidate` calls on the Hinadori
-host, against that host's cuBLAS (which dispatches the mma.sync code path). The
-final harness-host runtime (2.44 ms) does **not** carry over to the test host:
-there the same kernel runs in 2.085 ms, but the test-host cuBLAS runs in 1.926
-ms.
+Per-attempt milestones. Speedup is against the dev-host cuBLAS reference
+(~2.60 ms on this shape, dispatching the older `mma.sync` path):
 
-| id | runtime | GF/s | speedup vs harness cuBLAS | move |
+| id | runtime | GF/s | speedup vs dev-host cuBLAS | move |
 |---:|--------:|------:|--------:|------|
-| 0 | 27.7 ms | 24.8k | 0.10× | starter (your `13_tensorcore.cu` WMMA scaffold) |
-| 2 | 7.52 ms | 91.4k | 0.35× | **WMMA tiled + coalesced loads** ✓ |
-| 4 | 3.73 ms | 184k | 0.70× | **vectorized float4 / half2 loads** ✓ |
-| 6 | 3.56 ms | 193k | 0.74× | **explicit `ldmatrix` + `mma.sync.m16n8k16` PTX** ✓ |
-| 8 | 89.7 ms | 7.7k | 0.03× | 256×256 tiles — register spill ✗ |
-| 11 | 3.37 ms | 204k | 0.78× | `cp.async` deep pipeline — plateau, never recovered ✗ |
-| 15 | 3.28 ms | 209k | 0.80× | **padded shared + GROUP=8 swizzle** ✓ |
-| 17 | 2.79 ms | 247k | 0.95× | **dedicated `convert_kernel` (fp32→fp16 split)** ✓ ★ |
-| **18** | **2.45 ms** | **281k** | **1.07×** | **+ BK=64 (lighter prefetch path) ★ FIRST harness-host BEAT** |
-| 21 | 2.44 ms | 281k | 1.07× | confirmation |
+| 0 | 4.70 ms | 146k | 0.56× | starter scaffold (`nvcuda::wmma`) |
+| 3 | 3.28 ms | 209k | 0.79× | **early tile + swizzle** ✓ |
+| 6 | 2.62 ms | 262k | 0.99× | **explicit `mma.sync.m16n8k16` + `cp.async` pipeline** ✓ — matches cuBLAS |
+| 13–14, 18 | — | — | — | first `wgmma` bring-up attempts: mean-abs-error ~11–16 ✗ |
+| **22** | **2.09 ms** | **329k** | **1.25×** | **first working `wgmma.mma_async.m64n64k16`** ✓ ★ FIRST cuBLAS BEAT |
+| 24 | 1.74 ms | 394k | 1.48× | **`WGCNT=2` warpgroups (BM=128)** ✓ |
+| **28** | **1.66 ms** | **414k** | **1.56×** | **`wgmma.mma_async.m64n128k16` + `NSTAGE=4`** ✓ ★ final best |
+| 31 | 1.68 ms | 410k | 1.56× | confirmation |
+| 33, 35 | — | — | — | regression branch: same ~11.6 mae as earlier `wgmma` bring-up, reverted ✗ |
 
-What didn't work (measured + rejected on the harness host): TF32 path
-(catastrophic shared bank conflicts), `cp.async` pipelines (both
-conversion-aware and deep fp16 versions), 256×256 tiles (register spill → 89.7
-ms regression), higher occupancy / smaller warp tiles, BK=16, convert-at-load,
-interleaved store.
+(Runtimes in this table are dev-host measurements; the 1.197 ms / 574k GF
+headline in the Result section is the test-host re-benchmark of the same
+final kernel.)
 
-## Cross-host comparison
+## Final kernel
 
-| host | role | cuBLAS GFLOPS | cuBLAS ms | candidate GFLOPS | candidate ms | margin |
-|---|---|---:|---:|---:|---:|---:|
-| Hinadori H100 | harness | 262,089 | 2.623 | 281,329 | 2.443 | candidate +7.3% |
-| Tsubame H100 | **test** | 356,962 | 1.926 | 329,717 | 2.085 | **cuBLAS +8.2%** |
+Key design points of [`13_tensorcore.cu`](13_tensorcore.cu):
 
-Candidate gained 17% going harness → test (2.443 → 2.085 ms), consistent with
-clock / memory-bandwidth headroom between hosts. cuBLAS gained 36% (2.623 →
-1.926 ms), which is too large to be clock scaling alone — that is an algorithm
-change. To confirm: `nsys profile ./best_kernel` on both and check the cuBLAS
-kernel name (`sm90_xmma_gemm_*` / `cutlass3_sm90_*` on the test host vs
-`ampere_*_gemm_*` / `cutlass_80_*` on the harness host). Likely upstream cause
-is a CUDA / cuBLAS version delta (12.0 vs 12.3+); clock locking, power caps, and
-SKU differences (SXM5 / NVL / PCIe) are secondary.
+- `wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16` — Hopper warp-group MMA
+- `BM=128 BN=256 BK=64`, `WGCNT=2` warpgroups along M, `NMMA=2` wgmma per warpgroup
+- 4-stage `cp.async` software pipeline (`NSTAGE=4`)
+- Padded shared memory with per-stage A and B swizzle tiles
+- Build: `nvcc -O3 -std=c++17 --use_fast_math -arch=sm_90a -lcublas`
 
-## Honest caveats
+The agent climbed the Hopper instruction ladder:
+`nvcuda::wmma` → `mma.sync.m16n8k16` → `wgmma.mma_async`. Still missing
+relative to a maxed-out Hopper matmul: TMA
+(`cp.async.bulk.tensor` + `cuTensorMapEncodeTiled`), thread-block clusters
+/ DSMEM, `mbarrier`-coordinated warp specialization, and stream-K /
+persistent launches. Those are likely where the next 20–30 percentage
+points of peak live.
 
-The harness-host beat is on the specific shape `(10240, 8192, 4096)` and the
-specific cuBLAS the harness host happens to dispatch (DEFAULT algo, no
-`cublasLt` tuning, mma.sync code path). The test host demonstrates exactly the
-pre-existing concern: a different cuBLAS config / version on the same hardware
-family yields 5–25%+ faster cuBLAS, which shrinks or inverts the candidate's
-margin. The kernel only handles shapes where `m % 128 == 0, n % 256 == 0, k % 64
-== 0`. It always computes `α=1, β=0` (the reference's actual call); it is not a
-general GEMM. All numbers are reproducible: see `attempts/sample_21.json` for
-the harness-host trace and the standalone `best_kernel.cu` for the test-host
-benchmark.
+## Didn't work (measured + rejected)
+
+- Early `wgmma` bring-up: mean-abs-error ~11–16, indicating wrong fragment
+  layout or shared-memory descriptor encoding. Eventually fixed.
+- Attempts to call cuBLAS from inside the candidate kernel: rejected —
+  calling the reference library inside the candidate is not allowed.
+- Smaller tiles / higher occupancy: correct but 9–90× slower than the
+  current best.
+- A late-run `wgmma` rework re-introduced the same fragment-layout bug
+  from earlier bring-up (same ~11.6 mean-abs-error signature). Did not
+  count toward best.
